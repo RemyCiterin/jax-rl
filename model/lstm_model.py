@@ -6,8 +6,7 @@ import chex
 from utils.conventions import *
 
 class MLP_MODEL(hk.RNNCore):
-    def __init__(self, outDim, num_heads):
-        self.num_heads = num_heads
+    def __init__(self, outDim):
         self.outDim = outDim
         super().__init__()
 
@@ -17,7 +16,7 @@ class MLP_MODEL(hk.RNNCore):
     def __call__(self, obs : Observation, state_tm1):
 
         state_tm1 = jax.tree_map(
-            lambda state : jax.vmap(lambda a, b : a * b)(state, obs.done_tm1), 
+            lambda state : jax.vmap(lambda a, b : a * b)(state, 1-obs.done_tm1), 
             state_tm1
         )
 

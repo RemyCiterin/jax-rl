@@ -21,20 +21,20 @@ class FrameStack(gym.Wrapper):
         obs, reward, done, info = self.env.step(action)
         self.deque.append(obs)
 
-        return np.concatenate(self.deque, axis=0), reward, done, info
+        return np.concatenate(self.deque, axis=-1), reward, done, info
 
     def reset(self):
         obs = self.env.reset()
         for _ in range(self.k): self.deque.append(obs)
 
-        return np.concatenate(self.deque, axis=0)
+        return np.concatenate(self.deque, axis=-1)
 
 
 class ResizeWrapper(gym.ObservationWrapper):
     def __init__(self, env, x=84, y=84, gray=True):
         super().__init__(env)
 
-        self.observation_space = gym.spaces.Box(0, 255, shape=(1 if gray else 3, x, y), dtype=np.uint8)
+        self.observation_space = gym.spaces.Box(0, 255, shape=(x, y, 1 if gray else 3), dtype=np.uint8)
         self.gray = gray
         self.x = x
         self.y = y

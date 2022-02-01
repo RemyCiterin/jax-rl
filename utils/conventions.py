@@ -20,26 +20,28 @@ class Observation:
     obs : chex.Array
     done_tm1 : chex.Array
 
+@chex.dataclass
 class Tau:
     obs : Observation
     done : chex.Array
     reward : chex.Array
     action : chex.Array
     logits : chex.Array
+    rnn : chex.ArrayTree
 
 @chex.dataclass
 class HyperParams:
-    alpha_is : chex.array
-    lambda_ : chex.array
-    KL_coef : chex.Array
-    H_coef : chex.Array
-    P_coef : chex.Array
-    V_coef : chex.Array
-    gamma : chex.Array
+    V_coef  : chex.Array = 1.0
+    P_coef  : chex.Array = 1.0
+    IS_coef : chex.Array = 1.0
+    KL_coef : chex.Array = 5.0
+    Gamma   : chex.Array = 0.99
+    Lambda  : chex.Array = 0.95
+    H_coef  : chex.Array = 0.01
 
 
 def to_np(params):
-    return jax.tree_map(np.array, params)
+    return jax.tree_map(np.asarray, params)
 
 def to_jnp(params):
     return jax.tree_map(jnp.array, params)

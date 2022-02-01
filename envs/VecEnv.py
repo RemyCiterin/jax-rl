@@ -47,7 +47,7 @@ class AsyncEnv(object):
         #mp.set_start_method("spawn")
 
         for i in range(n):
-            process = Process(target=VecEnv.run_env, args=(i, env_fun, self.shared_obs[i], self.Qout[i], self.Qin, m, render and i == 0))
+            process = Process(target=AsyncEnv.run_env, args=(i, env_fun, self.shared_obs[i], self.Qout[i], self.Qin, m, render and i == 0))
             if sleep_at_init: time.sleep(0.1)
             process.start()
 
@@ -163,7 +163,7 @@ class SyncEnv(object):
         self.shared_obs = [[SharedArray((batch_size,) + shape, dtype) for _ in range(m)] for _ in range(n)]
 
         for i in range(n):
-            process = Process(target=VecEnv2.run_env, args=(
+            process = Process(target=SyncEnv.run_env, args=(
                 i, env_fun, self.shared_obs[i], self.Qout[i], self.Qin, m, batch_size, render and i == 0))
             if sleep_at_init: time.sleep(0.1)
             process.start()
@@ -172,7 +172,7 @@ class SyncEnv(object):
 
         for i in range(n):
             for j in range(m):
-                self.Qin.put((0, False, i, j))
+                self.Qin.put((np.zeros((batch_size,)), np.zeros((batch_size,)), i, j))
 
         self.batch_size = batch_size
 

@@ -1,4 +1,4 @@
-import Tree 
+import utils.Tree as Tree 
 
 import numpy as np 
 

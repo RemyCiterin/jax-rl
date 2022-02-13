@@ -1,6 +1,3 @@
-# copier-coller depuis stables-baselines : 
-# tensorflow.contrib n'est pas reconnue quand
-# je l'import depuis la source
 
 import numpy as np
 import os
@@ -80,12 +77,11 @@ class MaxAndSkipEnv(gym.Wrapper):
     def reset(self, **kwargs):
         return self.env.reset(**kwargs)
 
-def make_env(ident, render=False):
-    if render:
-        return FrameStack(MaxAndSkipEnv(
-            ResizeWrapper(gym.make(ident, render_mode="human"))
-        ))
+def make_env(ident, render=False, gray=True, stack=True):
+    if render: env = gym.make(ident, render_mode="human")
+    else: env = gym.make(ident)
 
-    return FrameStack(MaxAndSkipEnv(
-        ResizeWrapper(gym.make(ident))
-    ))
+    env = MaxAndSkipEnv(ResizeWrapper(env, gray=gray))
+
+    if stack: return FrameStack(env)
+    return env

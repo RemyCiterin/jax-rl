@@ -43,3 +43,15 @@ class SharedJaxParams(object):
     def copyto(self, params):
         jax.tree_map(lambda s, a : s.copyto(a), self.params, params)
 
+class FakeSharedJaxParams:
+    def __init__(self, params):
+        self.params = params
+
+    def set(self, params):
+        self.params = params
+
+    def get(self):
+        return self.params
+
+    def re_init(self):
+        pass

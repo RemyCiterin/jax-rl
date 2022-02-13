@@ -1,14 +1,29 @@
-from faster_fifo import Queue
-import faster_fifo_reduction
+
+try:
+    from faster_fifo import Queue
+    import faster_fifo_reduction
+except:
+    import multiprocessing as mp
+    class Queue:
+        def __init__(self, *args, **kargs):
+            self.queue = mp.Queue()
+
+        def put(self, *args, **kargs):
+            return self.queue.put(*args, **kargs)
+
+        def get(self, *args, **kargs):
+            return self.queue.get(*args, **kargs)
+
 from queue import Full, Empty
 
-from multiprocessing import Process
+import multiprocessing as mp
 import time
 
 import numpy as np
 
 from utils.SharedArray import SharedArray
 
+TIMEOUT = 120
 
 
 class AsyncEnv(object):
@@ -25,7 +40,8 @@ class AsyncEnv(object):
             Qout.put(ident)
 
         while True:
-            action, i = Qin.get()
+            action, i = Qin.get(timeout=TIMEOUT)
+
 
             if i is None:
                 [env.close() for env in env_list]
@@ -33,6 +49,8 @@ class AsyncEnv(object):
 
             obs, reward, done, _ = env_list[i].step(action)
             if done: obs = env_list[i].reset()
+
+            if render and i == 0: env_list[i].render()
 
             shared_obs[i].set(obs)
             Qout.put((reward, done, ident, i))
@@ -44,14 +62,15 @@ class AsyncEnv(object):
 
         self.shared_obs = [[SharedArray(shape, dtype) for _ in range(m)] for _ in range(n)]
 
-        #mp.set_start_method("spawn")
+        ctx = mp.get_context('fork')
 
         for i in range(n):
-            process = Process(target=AsyncEnv.run_env, args=(i, env_fun, self.shared_obs[i], self.Qout[i], self.Qin, m, render and i == 0))
+            process = ctx.Process(
+                target=AsyncEnv.run_env, args=(i, env_fun, self.shared_obs[i], self.Qout[i], self.Qin, m, render and i == 0), daemon=True)
             if sleep_at_init: time.sleep(0.1)
             process.start()
 
-        for _ in range(n*m): self.Qin.get()
+        for _ in range(n*m): self.Qin.get(timeout=TIMEOUT)
 
         for i in range(n):
             for j in range(m):
@@ -76,7 +95,7 @@ class AsyncEnv(object):
         done = np.zeros((self.batch_size,), dtype=bool)
         
         for k in range(self.batch_size):
-            r, d, i, j = self.Qin.get()
+            r, d, i, j = self.Qin.get(timeout=TIMEOUT)
 
             self.shared_obs[i][j].copyto(obs[k])
             ident[k] = i * self.m + j
@@ -88,6 +107,11 @@ class AsyncEnv(object):
     def close(self):
         for i in range(self.n):
             self.Qout[i].put((None, None))
+
+    def re_init(self):
+        for i in range(self.n):
+            for j in range(self.m):
+                self.shared_obs[i][j].re_init()
 
 
 import gym
@@ -126,8 +150,8 @@ class SeqVecEnv(gym.Env):
 
         return np.stack(obs, axis=0), np.array(reward, dtype=float), np.array(done, dtype=bool), {}
 
-    def render(self, mode="rgb_array"):
-        self.env_list[0].render(mode)
+    def render(self, *args, **kargs):
+        self.env_list[0].render(*args, **kargs)
 
     def close(self):
         [env.close() for env in self.env_list]
@@ -145,13 +169,15 @@ class SyncEnv(object):
             Qout.put(ident)
 
         while True:
-            action, i = Qin.get(timeout=60)
+            action, i = Qin.get(timeout=TIMEOUT)
 
             if i is None: 
                 [env.close() for env in env_list]
                 return
 
             obs, reward, done, _ = env_list[i].step(action)
+
+            if i == 0 and render: env_list[i].render()
 
             shared_obs[i].set(obs)
             Qout.put((reward, done, ident, i))
@@ -162,13 +188,15 @@ class SyncEnv(object):
 
         self.shared_obs = [[SharedArray((batch_size,) + shape, dtype) for _ in range(m)] for _ in range(n)]
 
+        ctx = mp.get_context('fork')
+
         for i in range(n):
-            process = Process(target=SyncEnv.run_env, args=(
-                i, env_fun, self.shared_obs[i], self.Qout[i], self.Qin, m, batch_size, render and i == 0))
+            process = ctx.Process(target=SyncEnv.run_env, args=(
+                i, env_fun, self.shared_obs[i], self.Qout[i], self.Qin, m, batch_size, render and i == 0), daemon=True)
             if sleep_at_init: time.sleep(0.1)
             process.start()
 
-        for _ in range(n*m): self.Qin.get(timeout=60)
+        for _ in range(n*m): self.Qin.get(timeout=TIMEOUT)
 
         for i in range(n):
             for j in range(m):
@@ -186,7 +214,7 @@ class SyncEnv(object):
         self.Qout[ident // self.m].put((actions, ident % self.m))
     
     def recv(self):
-        reward, done, i, j = self.Qin.get()
+        reward, done, i, j = self.Qin.get(timeout=TIMEOUT)
         obs = self.shared_obs[i][j].get()
         ident = i * self.m + j
 
@@ -195,5 +223,10 @@ class SyncEnv(object):
     def close(self):
         for i in range(self.n):
             self.Qout[i].put((None, None))
+
+    def re_init(self):
+        for i in range(self.n):
+            for j in range(self.m):
+                self.shared_obs[i][j].re_init()
 
 

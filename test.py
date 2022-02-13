@@ -3,75 +3,85 @@ os.environ["XLA_GPU_STRICT_CONV_ALGORITHM_PICKER"] = "false"
 os.environ['XLA_PYTHON_CLIENT_PREALLOCATE']='false'
 os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION']='.30'
 
-import numpy as np
+from envs.wrapper import make_env
+def env_fn():
+    return make_env("BreakoutNoFrameskip-v4", gray=True, stack=True)
 
 from utils.conventions import *
-from algorithms.Agent import Agent
-from model.lstm_model import CONV_MODEL
-from jax.random import PRNGKey, split
+
+from model.Q_model import *
+from algorithms.Q_IMPALA import *
+
+from jax.random import PRNGKey
 import jax.numpy as jnp
 
-from functools import partial
+def make_agent():
+    agent = Agent(CONV_MODEL, (84, 84 ,4), 4, use_H_target=True)
+    agent.obs_process = jax.jit(lambda t : jnp.transpose(t, (0, 1, 3, 4, 2)) / 255.0)
+    #agent.obs_process = jax.jit(lambda t : t / 255.0)
+    return agent
 
+class FakeSyncEnv:
+    def __init__(self, name, num_envs, batch_size):
+        
+        import envpool
+        self.env = envpool.make_gym(name, num_envs=num_envs, batch_size=batch_size)
+        self.batch_size = batch_size
+        self.n = num_envs
+        self.m = 1
 
-from algorithms.PartialTau import PartialTau
+        self.env.async_reset()
 
-agent = Agent(CONV_MODEL, (84, 84 ,4), 4)
-agent.obs_process = jax.jit(lambda t : t / 255.0)
+    def recv(self):
+        obs, reward, done, info = self.env.recv()
+        return obs, reward, done, info['env_id']
 
-params = agent.init_params(PRNGKey(42))
-opti_state = agent.init_state(params)
+    def send(self, *args, **kargs):
+        self.env.send(*args, **kargs)
 
-from envs.wrapper import make_env
-from envs.VecEnv import SyncEnv
+    def close(self, *args, **kargs):
+        self.env.close(*args, **kargs)
 
-env_fn = lambda : make_env("BreakoutNoFrameskip-v4")
+    def re_init(self, *args, **kargs):
+        pass
 
-N_steps = 10
+if __name__ == "__main__":
+    import multiprocessing as mp
+    ctx = mp.get_context("spawn")
 
-env_m = 2
-env_n = 16
-batch_size = 32
-env = SyncEnv(env_fn, (84, 84, 4), np.uint8, env_n, env_m, batch_size)
+    import numpy as np
+    from utils.conventions import *
+    from jax.random import PRNGKey
+    from utils.queue import Queue
 
-current_r_sum = jnp.zeros((env_n * env_m, batch_size))
-last_r_sum    = jnp.zeros((env_n * env_m, batch_size))
+    agent = make_agent()
 
-@partial(jax.jit, backend="cpu")
-def update_recoder(idx, reward, done, c_sum, l_sum):
-    return (
-        c_sum.at[idx].set((c_sum.at[idx].get() + reward) * (1 - done)), 
-        l_sum.at[idx].set((c_sum.at[idx].get() + reward) * done + l_sum.at[idx].get() * (1-done))
-    )
+    from envs.wrapper import make_env
+    from envs.VecEnv import SyncEnv, AsyncEnv
 
-partial_tau = [PartialTau(N_steps, use_ETD=False) for _ in range(env_n * env_m)]
-rnn_state  = [agent.init_rnn(batch_size) for _ in range(env_n*env_m)]
-prev_state = [None for _ in range(env_n*env_m)]
+    N_steps = 10
 
-steps = 0
-rng = PRNGKey(42)
+    env_m = 5
+    env_n = 16
+    batch_size = 32
+    #env = AsyncEnv(env_fn, (84, 84, 4), np.uint8, env_n, env_m, batch_size, render=True)
+    env = FakeSyncEnv("Breakout-v5", 96, 32)
 
-while True:
-    obs, reward, done, ident = env.recv()
-    obs = Observation(obs=obs, done_tm1=done)
+    try:
+        import threading
+        from algorithms.Actor import *
+        from algorithms.Learner import *
+        from utils.SharedArray import *
 
-    rng, _rng = split(rng)
-    actions, logits, rnn = to_np(agent.get_action(_rng, params, obs, rnn_state[ident]))
-    env.send(actions.astype(np.int64), ident)
+        params = agent.init_params(PRNGKey(42))
+        shared_params = FakeSharedJaxParams(params)
 
-    current_r_sum, last_r_sum = update_recoder(ident, reward, done, current_r_sum, last_r_sum)
+        learner_queue = Queue(128, is_mp_queue=False)
 
-    if not prev_state[ident] is None:
-        p_obs, p_rnn, p_actions, p_logits = prev_state[ident]
-        tau = partial_tau[ident].add_transition(p_obs, p_rnn, p_logits, p_actions, np.clip(reward, -1, 1), done, obs, rnn)
-        if not tau is None: opti_state, param, _ = agent.update(agent.V_TRACE_LOSS, params, opti_state, tau, HyperParams())
+        process = [threading.Thread(target=workAsync, args=(env, make_agent, shared_params, learner_queue, WorkerArgs()), daemon=True) for _ in range(1)]
+        [p.start() for p in process]
 
+        learnAsync(shared_params, make_agent, learner_queue, agent.RETRACE_LOSS, HyperParams(), 3600)
 
-    prev_state[ident] = obs, rnn_state[ident], actions, logits
-    rnn_state[ident] = rnn
-
-
-    steps += 1
-
-    if steps % 100 == 0:
-        print(end=f"\r{steps}   {np.mean(last_r_sum)}   ")
+    except KeyboardInterrupt:
+        env.close()

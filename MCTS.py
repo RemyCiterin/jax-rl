@@ -42,14 +42,19 @@ class NODE_STATE:
         return UCB
 
     @partial(jax.jit)
-    def update_state(self, G, action, index):
+    def update_state(self, G, action, index, reward):
 
         I = jax.lax.cond(
-            jnp.less(self.I.at[action].get(), 0), 
-            lambda _ : self.I.at[action].set(index), 
+            jnp.less(self.I.at[action].get(), 0),
+            lambda _ : self.I.at[action].set(index),
             lambda _ : self.I, None)
 
-        return NODE_STATE(S=self.S, P=self.P, R=self.R, I=I, V=self.V, 
+        R = jax.lax.cond(
+            jnp.less(self.I.at[action].get(), 0), 
+            lambda _ : self.R.at[action].set(reward), 
+            lambda _ : self.R, None)
+
+        return NODE_STATE(S=self.S, P=self.P, R=R, I=I, V=self.V, 
             Q=self.Q+jax.nn.one_hot(action, len(self.N)) * (G-self.Q) / (self.N+1),
             N=self.N+jax.nn.one_hot(action, len(self.N)))
 
@@ -93,54 +98,83 @@ class MCTS_TREE:
     @partial(jax.jit, static_argnames=('model', 'max_depth'))
     def simulate(self, rng:chex.Array, index:chex.Array, model:MODEL, params:PARAMS, max_depth:int):
         
+        index_list = -jnp.ones((max_depth+1,), dtype=int)
+        action_list = jnp.ones((max_depth+1,), dtype=int)
+        value_list = jnp.zeros((max_depth+1,))
+
+        def body_fun(state):
+            index_list, action_list, value_list, index, i = state
+
+            node = jax.tree_map(lambda t : t.at[index].get(), self.Nodes)
+            action = node.get_action(params)
+
+            return index_list.at[i].set(index), action_list.at[i].set(action),\
+                value_list.at[i].set(node.R.at[action].get()), node.I.at[action].get(), i+1
+
+        def cond_fun(state):
+            _, _, _, index, i = state
+            return jnp.logical_and(jnp.less(i, max_depth+1), jnp.greater_equal(index, 0))
+
+        index_list, action_list, value_list, _, i_p1 = jax.lax.while_loop(
+            cond_fun, body_fun, (index_list, action_list, value_list, index, jnp.array(0, dtype=int)))
+
+        index, action = index_list.at[i_p1-1].get(), action_list.at[i_p1-1].get()
         node = jax.tree_map(lambda t : t.at[index].get(), self.Nodes)
-        action = node.get_action(params)
 
-        def leaf_case(_):
-            index_list = -jnp.ones((max_depth+1,))
-            value_list = jnp.zeros((max_depth+1,))
-            action_list = jnp.ones((max_depth+1,))
+        S, r = model.dynamics(node.S, action)
+        model_output = model.evaluation(S)
+        P = jax.nn.softmax(model_output.logits)
 
+        new_node = NODE_STATE.init_node(S=S, P=P, V=model_output.value)
+        value_list = value_list.at[i_p1-1].set(r+params.gamma*new_node.V)
 
-            S, r = model.dynamics(node.S, action)
-            model_output = model.evaluation(S)
-            P = jax.nn.softmax(
-                model_output.logits)
+        for i in range(len(value_list)-2, -1, -1):
+            value_list = value_list.at[i].add(params.gamma * value_list.at[i+1].get())
 
-            new_node = NODE_STATE.init_node(S=S, P=P, V=model_output.value)
+        return index_list, value_list, action_list, new_node, r, max_depth+1-i_p1
 
-            return index_list.at[0].set(index), value_list.at[0].set(r+params.gamma*new_node.V), \
-                action_list.at[0].set(action), new_node, r
+    @partial(jax.jit)
+    def update(self, index_list, value_list, action_list, new_node, last_reward, final_depth):
+        new_index_or_minus_one = len(self.Nodes.V) * jnp.greater(final_depth, 0) - jnp.equal(final_depth, 0)
 
-        def node_case(_):
-            index_list, value_list, action_list, new_node, r = self.simulate(rng, index, model, params, max_depth-1)
+        def body_fun(state):
+            i, tree = state
 
-            value = node.R.at[action].get() + params.gamma * value_list.at[0].get()
+            node = jax.tree_map(lambda t : t.at[index_list.at[i].get()].get(), tree.Nodes)
+            update_node = node.update_state(value_list.at[i].get(), action_list.at[i].get(), 
+                new_index_or_minus_one, last_reward)
 
-            return jnp.concatenate((index[None], index_list), axis=0), \
-                jnp.concatenate((value[None], value_list), axis=0), \
-                jnp.concatenate((action[None], action_list), axis=0), new_node, r
+            return i+1, MCTS_TREE(
+                Nodes=jax.tree_map(lambda x, y : x.at[index_list.at[i].get()].set(y), tree.Nodes, update_node))
 
-        if max_depth <= 0: return leaf_case(None)
+        def cond_fun(state):
+            i, tree = state
 
-        #print(
-        #    jax.tree_map(lambda t : t.shape, leaf_case(None)),
-        #    jax.tree_map(lambda t : t.shape, node_case(None)))
-
-        return jax.lax.cond(
-            jnp.less(node.I.at[action].get(), 0),
-            leaf_case, node_case, None)
-
-        @partial(jax.jit)
-    def update(self, index_list, value_list, action_list, new_node, last_reward):
-        pass
-
+            return jnp.logical_and(
+                jnp.less(i, len(index_list)),
+                jnp.greater_equal(index_list.at[i].get(), 0))
         
+        tree = jax.lax.while_loop(cond_fun, body_fun, (jnp.array(0, dtype=int), self))[1]
+        return MCTS_TREE(Nodes=jax.tree_map(lambda x, y : jnp.concatenate((x, y[None]), axis=0), tree.Nodes, new_node))
+
+    @partial(jax.jit, static_argnames=('num_sim', 'max_depth', 'model'))
+    def mcts_step(self, rng, model, params, max_depth, num_sim):
+        for _ in range(num_sim):
+            rng, rng_ = jax.random.split(rng)
+            index_list, value_list, action_list, new_node, last_reward, final_depth = self.simulate(
+                rng_, jnp.array(0, dtype=int), model, params, max_depth)
+
+            self = self.update(index_list, value_list, action_list, new_node, last_reward, final_depth)
+
+        return self
+
+
+import time
 
 
 rng = PRNGKey(43)
-mask = jnp.ones((81,))
-obs = jnp.zeros((81,))
+mask = jnp.ones((3,))
+obs = jnp.zeros((3,))
 
 model = MODEL(
     representation=lambda o : o,
@@ -150,13 +184,45 @@ model = MODEL(
 
 params = PARAMS()
 
+"""
 
-tree = MCTS_TREE.init_tree(rng, obs, mask, model, params, noise='dirichlet')
+@partial(jax.jit, static_argnames=('model', 'noise'))
+def make_tree(rng, obs, mask, model, params, noise):
+    return jax.vmap(lambda _ : MCTS_TREE.init_tree(rng, obs, mask, model, params, noise))(jnp.arange(1024))
 
-index, value, actions, node, r = tree.simulate(PRNGKey(42), 0, model, params, 5)
+@partial(jax.jit, static_argnames=('num_sim', 'max_depth', 'model'))
+def make_step(tree, rng_, model, params, max_depth, num_sim):
+    return jax.vmap(lambda t : t.mcts_step(rng_, model, params, max_depth, num_sim))(tree)
 
-print(actions)
-print(index)
-print(value)
-print(node)
-print(r)
+for _ in range(10):
+    t = time.time()
+    print("-----------------")
+    rng, rng_ = jax.random.split(rng)
+    tree = make_tree(rng_, obs, mask, model, params, 'dirichlet')
+
+    tree = make_step(tree, rng_, model, params, 10, 50)
+    jax.tree_map(lambda t : t.block_until_ready(), tree)
+    print(time.time()-t)
+
+print(jax.tree_map(lambda t : t.shape, tree))
+
+"""
+
+tree = MCTS_TREE.init_tree(rng, obs, mask, model, params, "dirichlet")
+print(tree)
+
+
+index_list, value_list, action_list, new_node, last_reward, final_depth = tree.simulate(
+    rng, jnp.array(0, dtype=int), model, params, 0)
+
+print(index_list)
+print(value_list)
+print(action_list)
+print(new_node)
+print(last_reward)
+print(final_depth)
+
+
+tree = tree.update(index_list, value_list, action_list, new_node, last_reward, final_depth)
+
+print(tree)
